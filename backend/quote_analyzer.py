@@ -7,12 +7,14 @@ from .inflation import get_inflation_multiplier
 DB_PATH = os.path.join(os.path.dirname(__file__), "..", "database", "quotes.json")
 
 VALID_CATEGORIES = {
-    "Server Infrastructure",
-    "Network Equipment",
-    "Software Licenses",
-    "Cloud Services",
-    "IT Consulting",
-    "Cybersecurity Solutions",
+    "Water Treatment Infrastructure",
+    "Pipeline Infrastructure",
+    "Pumping Infrastructure",
+    "Network Rehabilitation",
+    "Civil & Structural Works",
+    "Mechanical & Electrical",
+    "Environmental & Compliance",
+    "Project Management & Consulting",
 }
 
 

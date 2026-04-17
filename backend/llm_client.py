@@ -18,4 +18,4 @@ def get_client() -> AzureOpenAI:
     return _client
 
 
-DEPLOYMENT: str = os.getenv("AZURE_OPENAI_DEPLOYMENT_NAME", "gpt-5.2")
+DEPLOYMENT: str = os.getenv("AZURE_OPENAI_DEPLOYMENT_NAME", "gpt-4.1-mini")
