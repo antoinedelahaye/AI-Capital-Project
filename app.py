@@ -1,5 +1,10 @@
+import base64
 import io
 import json
+import os
+import re
+
+import streamlit.components.v1 as components
 
 import pandas as pd
 import plotly.express as px
@@ -9,7 +14,7 @@ from pypdf import PdfReader
 
 from backend.chatbot import build_system_prompt, parse_quote
 from backend.llm_client import DEPLOYMENT, get_client
-from backend.quote_analyzer import analyze_quote, get_dataframe
+from backend.quote_analyzer import analyze_quote, get_dataframe, load_quotes
 
 # ── Page config ────────────────────────────────────────────────────────────────
 st.set_page_config(
@@ -286,6 +291,89 @@ html, body, [class*="css"] {
 
 /* ---------- dataframe ---------- */
 .stDataFrame { border-radius: 10px; overflow: hidden; }
+
+/* ---------- source panel ---------- */
+.src-panel-title {
+    font-size: 11px;
+    font-weight: 700;
+    color: #94A3B8;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    margin-bottom: 14px;
+    padding-bottom: 8px;
+    border-bottom: 1px solid #E2ECF8;
+}
+.src-file-card {
+    background: #fff;
+    border: 1px solid #E2ECF8;
+    border-radius: 10px;
+    margin-bottom: 12px;
+    overflow: hidden;
+    box-shadow: 0 1px 4px rgba(0,0,0,0.05);
+}
+.src-file-header {
+    background: linear-gradient(90deg, #EEF4FF 0%, #F0F7FF 100%);
+    padding: 9px 14px;
+    font-size: 12px;
+    font-weight: 600;
+    color: #0072BC;
+    border-bottom: 1px solid #E2ECF8;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+}
+.src-file-body {
+    padding: 10px 14px;
+    font-size: 11px;
+    color: #475569;
+    line-height: 1.6;
+    max-height: 160px;
+    overflow-y: auto;
+    white-space: pre-wrap;
+    font-family: 'Inter', monospace;
+}
+.src-quote-card {
+    background: #fff;
+    border: 1px solid #E2ECF8;
+    border-left: 3px solid #0097A7;
+    border-radius: 10px;
+    padding: 11px 14px;
+    margin-bottom: 10px;
+    box-shadow: 0 1px 4px rgba(0,0,0,0.05);
+}
+.src-quote-id {
+    font-weight: 700;
+    color: #0072BC;
+    font-size: 13px;
+    margin-bottom: 5px;
+}
+.src-quote-field {
+    font-size: 12px;
+    color: #64748B;
+    margin-top: 3px;
+    line-height: 1.4;
+}
+.src-empty {
+    text-align: center;
+    padding: 50px 20px;
+    color: #CBD5E1;
+}
+.src-cited-badge {
+    display: inline-block;
+    background: #0097A7;
+    color: #fff;
+    font-size: 9px;
+    font-weight: 700;
+    letter-spacing: 0.06em;
+    padding: 2px 7px;
+    border-radius: 20px;
+    margin-left: 8px;
+    vertical-align: middle;
+    text-transform: uppercase;
+}
+
+/* ---------- hide "press enter to submit" hint ---------- */
+[data-testid="InputInstructions"] { display: none !important; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -298,9 +386,68 @@ def _stream(api_stream):
             yield chunk.choices[0].delta.content
 
 
+_DB_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "database")
+
+
+try:
+    import fitz as _fitz
+except ImportError:
+    _fitz = None
+
+
+def _extract_highlight_terms(response_text: str) -> list[str]:
+    terms: set[str] = set()
+    terms.update(re.findall(r'£[\d,]+(?:\.\d+)?', response_text))
+    terms.update(re.findall(r'\b\d{1,3}(?:,\d{3})+(?:\.\d+)?\b', response_text))
+    terms.update(re.findall(r'\b\d{4,6}\b', response_text))
+    terms.update(re.findall(r'\b\d{4}-\d{2}-\d{2}\b', response_text))
+    terms.update(re.findall(r'\b[A-Z][a-z]+(?:\s[A-Z][a-z]+)+\b', response_text))
+    return [t for t in terms if len(t) >= 3]
+
+
+def _make_highlighted_pdf(pdf_path: str, terms: list[str]) -> bytes:
+    if _fitz is None:
+        with open(pdf_path, "rb") as f:
+            return f.read()
+    doc = _fitz.open(pdf_path)
+    for page in doc:
+        for term in terms:
+            for rect in page.search_for(term):
+                annot = page.add_highlight_annot(rect)
+                annot.set_colors(stroke=(1.0, 0.92, 0.23))
+                annot.update()
+    return doc.tobytes()
+
+
+def _extract_sources(response_text: str) -> dict:
+    sources: dict = {"pdfs": [], "quotes": [], "response_text": response_text}
+    cited_pdfs = {p.lower() for p in re.findall(r"\b([\w\-]+\.pdf)\b", response_text, re.IGNORECASE)}
+    for fname in sorted(os.listdir(_DB_DIR)):
+        if not fname.lower().endswith(".pdf"):
+            continue
+        stem = re.sub(r"_\d{8}", "", fname[:-4]).lower()
+        if fname.lower() in cited_pdfs or stem in response_text.lower():
+            fpath = os.path.join(_DB_DIR, fname)
+            try:
+                reader = PdfReader(fpath)
+                text = "\n".join(p.extract_text() or "" for p in reader.pages).strip()
+                if text:
+                    sources["pdfs"].append({"filename": fname, "text": text, "path": fpath})
+            except Exception:
+                pass
+    cited_ids = set(re.findall(r"\b(Q\d{3,4})\b", response_text))
+    if cited_ids:
+        sources["quotes"] = [q for q in load_quotes() if q.get("id") in cited_ids]
+    return sources
+
+
 # ── Session state ──────────────────────────────────────────────────────────────
 if "messages" not in st.session_state:
     st.session_state.messages = []
+if "last_sources" not in st.session_state:
+    st.session_state.last_sources = {"pdfs": [], "quotes": [], "response_text": ""}
+if "pending_response" not in st.session_state:
+    st.session_state.pending_response = False
 
 # ── Hero banner ────────────────────────────────────────────────────────────────
 st.markdown("""
@@ -333,66 +480,128 @@ CATEGORIES = [
 
 # ── Tab 1 : Chatbot ────────────────────────────────────────────────────────────
 with tab1:
-    st.markdown("""
-    <div class="chat-header">
-      <div>
-        <div style="display:flex;align-items:center;gap:8px;">
-          <span class="chat-title">Procurement Intelligence Assistant</span>
-          <span class="chat-badge">AI</span>
-        </div>
-        <div class="chat-sub">Ask about historical quotes, contractor performance, pricing trends, AMP8 benchmarks&hellip;</div>
-      </div>
-    </div>
-    """, unsafe_allow_html=True)
+    chat_col, src_col = st.columns([3, 2], gap="large")
 
-    with st.form("chat_form", clear_on_submit=True):
-        col_input, col_btn, col_clear = st.columns([8, 1, 1])
-        with col_input:
-            prompt = st.text_input(
-                "prompt",
-                placeholder="e.g. What did we pay for ductile iron pipes? Which contractor quoted lowest on pipeline work?",
-                label_visibility="collapsed",
-            )
-        with col_btn:
-            submitted = st.form_submit_button("Send ➤", use_container_width=True)
-        with col_clear:
-            cleared = st.form_submit_button("Clear", use_container_width=True)
-
-    if cleared:
-        st.session_state.messages = []
-        st.rerun()
-
-    if submitted and prompt.strip():
-        st.session_state.messages.append({"role": "user", "content": prompt.strip()})
-        with st.spinner("Analysing your question…"):
-            system_prompt = build_system_prompt()
-        api_messages = [{"role": "system", "content": system_prompt}] + [
-            {"role": m["role"], "content": m["content"]}
-            for m in st.session_state.messages
-        ]
-        stream = client.chat.completions.create(
-            model=DEPLOYMENT,
-            messages=api_messages,
-            stream=True,
-            temperature=0.3,
-            max_completion_tokens=800,
-        )
-        response = "".join(_stream(stream))
-        st.session_state.messages.append({"role": "assistant", "content": response})
-        st.rerun()
-
-    for msg in reversed(st.session_state.messages):
-        with st.chat_message(msg["role"]):
-            st.markdown(msg["content"])
-
-    if not st.session_state.messages:
+    with chat_col:
         st.markdown("""
-        <div style="text-align:center;padding:40px 20px;color:#94A3B8;">
-          <div style="font-size:40px;margin-bottom:12px;">💬</div>
-          <div style="font-size:15px;font-weight:500;color:#64748B;">No conversation yet</div>
-          <div style="font-size:13px;margin-top:6px;">Try asking about quotes, contractors, or price trends</div>
+        <div class="chat-header">
+          <div>
+            <div style="display:flex;align-items:center;gap:8px;">
+              <span class="chat-title">Procurement Intelligence Assistant</span>
+              <span class="chat-badge">AI</span>
+            </div>
+            <div class="chat-sub">Ask about historical quotes, contractor performance, pricing trends, AMP8 benchmarks&hellip;</div>
+          </div>
         </div>
         """, unsafe_allow_html=True)
+
+        with st.form("chat_form", clear_on_submit=True):
+            col_input, col_btn, col_clear = st.columns([5, 2, 1.5])
+            with col_input:
+                prompt = st.text_input(
+                    "prompt",
+                    placeholder="e.g. What did we pay for ductile iron pipes? Which contractor quoted lowest on pipeline work?",
+                    label_visibility="collapsed",
+                )
+            with col_btn:
+                submitted = st.form_submit_button("Send ➤", use_container_width=True)
+            with col_clear:
+                cleared = st.form_submit_button("Clear", use_container_width=True)
+
+        if cleared:
+            st.session_state.messages = []
+            st.session_state.last_sources = {"pdfs": [], "quotes": [], "response_text": ""}
+            st.session_state.pending_response = False
+            st.rerun()
+
+        # Stage 1: store user message immediately, then rerun to show it
+        if submitted and prompt.strip():
+            st.session_state.messages.append({"role": "user", "content": prompt.strip()})
+            st.session_state.pending_response = True
+            st.rerun()
+
+        # Show all messages (user message visible straight away)
+        for msg in reversed(st.session_state.messages):
+            with st.chat_message(msg["role"]):
+                st.markdown(msg["content"])
+
+        if not st.session_state.messages:
+            st.markdown("""
+            <div style="text-align:center;padding:40px 20px;color:#94A3B8;">
+              <div style="font-size:40px;margin-bottom:12px;">💬</div>
+              <div style="font-size:15px;font-weight:500;color:#64748B;">No conversation yet</div>
+              <div style="font-size:13px;margin-top:6px;">Try asking about quotes, contractors, or price trends</div>
+            </div>
+            """, unsafe_allow_html=True)
+
+        # Stage 2: call API after user message is rendered
+        if st.session_state.pending_response:
+            with st.spinner("Analysing your question…"):
+                system_prompt = build_system_prompt()
+                api_messages = [{"role": "system", "content": system_prompt}] + [
+                    {"role": m["role"], "content": m["content"]}
+                    for m in st.session_state.messages
+                ]
+                stream = client.chat.completions.create(
+                    model=DEPLOYMENT,
+                    messages=api_messages,
+                    stream=True,
+                    temperature=0.3,
+                    max_completion_tokens=800,
+                )
+                response = "".join(_stream(stream))
+            st.session_state.messages.append({"role": "assistant", "content": response})
+            st.session_state.last_sources = _extract_sources(response)
+            st.session_state.pending_response = False
+            st.rerun()
+
+    with src_col:
+        sources = st.session_state.last_sources
+        has_sources = bool(sources["pdfs"] or sources["quotes"])
+
+        st.markdown('<div class="src-panel-title">📎 &nbsp;Sources</div>', unsafe_allow_html=True)
+
+        if not has_sources:
+            st.markdown("""
+            <div class="src-empty">
+              <div style="font-size:32px;margin-bottom:10px;">📂</div>
+              <div style="font-size:13px;font-weight:500;color:#94A3B8;">No sources yet</div>
+              <div style="font-size:12px;margin-top:6px;color:#CBD5E1;">Files cited by the AI will<br>appear here after your first question.</div>
+            </div>
+            """, unsafe_allow_html=True)
+        else:
+            response_text = sources.get("response_text", "")
+            terms = _extract_highlight_terms(response_text)
+
+            for pdf in sources["pdfs"]:
+                st.markdown(
+                    f'<div class="src-file-header">📄 &nbsp;{pdf["filename"]}</div>',
+                    unsafe_allow_html=True,
+                )
+                pdf_bytes = _make_highlighted_pdf(pdf["path"], terms)
+                b64 = base64.b64encode(pdf_bytes).decode()
+                components.html(
+                    f"""<html><body style="margin:0;padding:0;background:#F8FAFE">
+                    <embed src="data:application/pdf;base64,{b64}"
+                           type="application/pdf"
+                           width="100%" height="430px"
+                           style="border:none;border-radius:0 0 10px 10px;display:block">
+                    </body></html>""",
+                    height=438,
+                )
+
+            for q in sources["quotes"]:
+                price = q.get("total_price", 0)
+                price_fmt = f"£{price:,.0f}" if isinstance(price, (int, float)) else str(price)
+                st.markdown(f"""
+                <div class="src-quote-card">
+                  <div class="src-quote-id">{q.get("id", "—")}</div>
+                  <div class="src-quote-field">🏢 &nbsp;{q.get("supplier", "—")}</div>
+                  <div class="src-quote-field">📋 &nbsp;{q.get("description", "—")}</div>
+                  <div class="src-quote-field">💷 &nbsp;{price_fmt} &nbsp;·&nbsp; {q.get("date", "—")}</div>
+                  <div class="src-quote-field">🏷️ &nbsp;{q.get("category", "—")}</div>
+                </div>
+                """, unsafe_allow_html=True)
 
 
 # ── Tab 2 : Quote Analysis ─────────────────────────────────────────────────────
@@ -890,3 +1099,32 @@ Be direct, use numbers, and reference contractor names and water industry standa
                     )
             except Exception as e:
                 st.error(f"Could not load database: {e}")
+
+
+if __name__ == "__main__":
+    import os
+    import subprocess
+    import sys
+    import threading
+    import time
+
+    if not os.environ.get("_AQUACAPITAL_LAUNCHED"):
+        import socket
+
+        def _open_edge():
+            for _ in range(30):
+                time.sleep(1)
+                try:
+                    with socket.create_connection(("localhost", 8501), timeout=1):
+                        break
+                except OSError:
+                    continue
+            subprocess.Popen(["cmd", "/c", "start", "msedge", "http://localhost:8501"])
+
+        threading.Thread(target=_open_edge, daemon=True).start()
+        env = os.environ.copy()
+        env["_AQUACAPITAL_LAUNCHED"] = "1"
+        subprocess.run(
+            [sys.executable, "-m", "streamlit", "run", __file__, "--server.headless=true"],
+            env=env,
+        )
