@@ -873,7 +873,11 @@ with tab1:
         # Stage 2: call API after user message is rendered
         if st.session_state.pending_response:
             with st.spinner("Analysing your question…"):
-                system_prompt = build_system_prompt()
+                last_user_msg = next(
+                    (m["content"] for m in reversed(st.session_state.messages) if m["role"] == "user"),
+                    "",
+                )
+                system_prompt = build_system_prompt(query=last_user_msg)
                 api_messages = [{"role": "system", "content": system_prompt}] + [
                     {"role": m["role"], "content": m["content"]}
                     for m in st.session_state.messages

@@ -31,3 +31,7 @@ ENV/
 # OS
 .DS_Store
 Thumbs.db
+
+# RAG vector index (auto-rebuilt from PDFs — do not commit)
+database/chroma_db/
+database/rag_manifest.json

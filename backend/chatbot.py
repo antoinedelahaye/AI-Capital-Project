@@ -1,47 +1,22 @@
 import json
 import os
 from datetime import datetime
-from pypdf import PdfReader
 from .quote_analyzer import load_quotes
 from .inflation import get_inflation_summary
 from .llm_client import get_client, DEPLOYMENT
+from .rag import build_index, retrieve, retrieve_by_document
 
 DB_DIR = os.path.join(os.path.dirname(__file__), "..", "database")
 
 
-def _load_pdf_texts() -> str:
-    """Extract text from all PDF files found in the database folder."""
-    parts = []
-    for fname in sorted(os.listdir(DB_DIR)):
-        if not fname.lower().endswith(".pdf"):
-            continue
-        path = os.path.join(DB_DIR, fname)
-        try:
-            reader = PdfReader(path)
-            text = "\n".join(page.extract_text() or "" for page in reader.pages).strip()
-            if text:
-                parts.append(f"=== {fname} ===\n{text}")
-        except Exception:
-            pass
-    return "\n\n".join(parts)
+def build_system_prompt(query: str = "") -> str:
+    """
+    Build the system prompt for the chatbot.
 
-
-def _load_pdf_texts_by_id() -> dict[str, str]:
-    """Return {quote_id: pdf_text} for all PDFs in the database folder."""
-    quotes = load_quotes()
-    id_to_file = {q["id"]: q.get("filename", "") for q in quotes}
-    result = {}
-    for qid, fname in id_to_file.items():
-        path = os.path.join(DB_DIR, fname)
-        try:
-            reader = PdfReader(path)
-            result[qid] = "\n".join(p.extract_text() or "" for p in reader.pages).strip()
-        except Exception:
-            result[qid] = ""
-    return result
-
-
-def build_system_prompt() -> str:
+    When *query* is provided the prompt includes only the PDF chunks most
+    relevant to that query (RAG).  The full quotes.json metadata is always
+    included — it is small and gives the model reliable structured facts.
+    """
     quotes = load_quotes()
     quotes_json = json.dumps(quotes, indent=2)
     today = datetime.today().strftime("%Y-%m-%d")
@@ -56,15 +31,27 @@ def build_system_prompt() -> str:
     except Exception:
         inflation_block = "Inflation data temporarily unavailable."
 
-    pdf_texts = _load_pdf_texts()
-    pdf_block = (
-        f"--- PDF QUOTE DOCUMENTS (database folder) ---\n{pdf_texts}\n--- END OF PDF DOCUMENTS ---"
-        if pdf_texts
-        else ""
-    )
+    # ── RAG: retrieve only relevant PDF chunks ─────────────────────────────────
+    pdf_block = ""
+    if query.strip():
+        try:
+            chunks = retrieve(query, k=6)
+            if chunks:
+                excerpts = "\n\n".join(
+                    f"[{c['quote_id']} — {c['source']} | relevance {c['score']:.2f}]\n{c['text']}"
+                    for c in chunks
+                )
+                pdf_block = (
+                    "--- RELEVANT PDF EXCERPTS (retrieved for this query) ---\n"
+                    f"{excerpts}\n"
+                    "--- END OF EXCERPTS ---"
+                )
+        except Exception:
+            pass  # RAG unavailable — answer from metadata alone
 
     return f"""You are a smart procurement assistant for a capital project management team.
-You have direct access to the company's historical quote database and all PDF quote documents shown below.
+You have direct access to the company's historical quote database and the most relevant
+excerpts from the PDF quote documents (retrieved for this specific question).
 Today's date is {today}.
 
 {inflation_block}
@@ -85,19 +72,36 @@ When answering questions:
 
 def find_comparable_quotes(submitted_text: str, parsed_quote: dict) -> dict:
     """
-    Use the LLM to identify which database PDFs are comparable to the submitted quote.
-    Returns {"comparable_ids": [...], "reasoning": "..."}.
+    Use RAG + LLM to identify which database PDFs are comparable to the
+    submitted quote.  Returns {{"comparable_ids": [...], "reasoning": "..."}}.
     """
     client = get_client()
     db_quotes = load_quotes()
-    pdf_texts = _load_pdf_texts_by_id()
 
-    db_summaries = "\n\n".join(
-        f"--- {q['id']} ({q['supplier']}, £{q['total_price']:,.0f}, {q['date']}) ---\n"
-        f"Description: {q['description']}\n"
-        f"Scope excerpt:\n{pdf_texts.get(q['id'], '')[:1200]}"
-        for q in db_quotes
+    # Build index if needed (no-op if fresh)
+    build_index()
+
+    # Retrieve the best-matching document excerpts for the submitted quote text
+    query = (
+        f"{parsed_quote.get('description', '')} "
+        f"{submitted_text[:800]}"
     )
+    doc_results = retrieve_by_document(query, top_docs=len(db_quotes), chunks_per_doc=2)
+
+    # Build per-quote summaries using retrieved excerpts
+    id_to_meta = {q["id"]: q for q in db_quotes}
+    db_summaries_parts = []
+    for doc in doc_results:
+        qid = doc["quote_id"]
+        meta = id_to_meta.get(qid, {})
+        excerpt = "\n".join(doc["excerpts"])
+        db_summaries_parts.append(
+            f"--- {qid} ({meta.get('supplier','')}, "
+            f"£{meta.get('total_price',0):,.0f}, {meta.get('date','')}) ---\n"
+            f"Description: {meta.get('description','')}\n"
+            f"Scope excerpt:\n{excerpt}"
+        )
+    db_summaries = "\n\n".join(db_summaries_parts)
 
     prompt = f"""You are a water infrastructure procurement specialist.
 
