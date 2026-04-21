@@ -4,15 +4,15 @@ import json
 import os
 import re
 
-import streamlit.components.v1 as components
-
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
+import streamlit.components.v1 as components
 from pypdf import PdfReader
 
-from backend.chatbot import build_system_prompt, parse_quote
+from backend.chatbot import (build_agent_summary, build_system_prompt,
+                             find_comparable_quotes, parse_line_items, parse_quote)
 from backend.llm_client import DEPLOYMENT, get_client
 from backend.quote_analyzer import analyze_quote, get_dataframe, load_quotes
 
@@ -181,6 +181,42 @@ html, body, [class*="css"] {
 .delta-neg { color: #DC2626; }
 .delta-neu { color: #64748B; }
 
+/* ---------- agent summary card ---------- */
+.agent-summary-card {
+    background: linear-gradient(135deg, #EFF6FF 0%, #E0F2FE 100%);
+    border: 1px solid #BAE6FD;
+    border-left: 5px solid #0072BC;
+    border-radius: 14px;
+    padding: 20px 22px;
+    margin-bottom: 20px;
+}
+.agent-summary-header {
+    display: flex; align-items: center; gap: 10px; margin-bottom: 12px;
+}
+.agent-summary-title { font-size: 14px; font-weight: 700; color: #1A237E; }
+.agent-summary-badge {
+    background: linear-gradient(135deg, #0072BC, #0097A7);
+    color: white; font-size: 10px; font-weight: 700;
+    padding: 2px 9px; border-radius: 12px; letter-spacing: 0.5px;
+}
+.agent-summary-body { color: #1E3A5F; font-size: 13.5px; line-height: 1.65; }
+
+/* ---------- 5-KPI row ---------- */
+.kpi5-grid { display: flex; gap: 10px; margin-bottom: 18px; flex-wrap: wrap; }
+.kpi5-card {
+    flex: 1; min-width: 110px; border-radius: 12px;
+    padding: 14px 10px; text-align: center; border: 2px solid;
+}
+.kpi5-card.green   { background: #F0FFF4; border-color: #86EFAC; }
+.kpi5-card.amber   { background: #FFFBEB; border-color: #FCD34D; }
+.kpi5-card.red     { background: #FFF0F0; border-color: #FCA5A5; }
+.kpi5-card.neutral { background: #F0F7FF; border-color: #B3D4F0; }
+.kpi5-flag  { font-size: 18px; margin-bottom: 3px; }
+.kpi5-label { font-size: 10px; color: #64748B; font-weight: 600;
+              text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 5px; }
+.kpi5-value { font-size: 20px; font-weight: 700; color: #1E293B; line-height: 1.1; }
+.kpi5-sub   { font-size: 10px; color: #64748B; margin-top: 3px; }
+
 /* ---------- insight card ---------- */
 .insight-card {
     background: linear-gradient(135deg, #F0F7FF 0%, #E8F4FE 100%);
@@ -230,6 +266,57 @@ html, body, [class*="css"] {
     border-radius: 12px;
     padding: 20px;
 }
+
+/* ---------- quote analysis column backgrounds ----------
+   Target Streamlit's own column vertical-block containers.
+   Tab 2 (Quote Analysis) is the 2nd tab-panel child.
+--------------------------------------------------------- */
+[data-baseweb="tab-panel"]:nth-of-type(2)
+  [data-testid="stHorizontalBlock"]
+  > [data-testid="column"]:first-child
+  > [data-testid="stVerticalBlock"] {
+    background: #EFF6FF;
+    border-radius: 16px;
+    padding: 20px 18px 24px 18px !important;
+    border: 1px solid #DBEAFE;
+}
+[data-baseweb="tab-panel"]:nth-of-type(2)
+  [data-testid="stHorizontalBlock"]
+  > [data-testid="column"]:last-child
+  > [data-testid="stVerticalBlock"] {
+    background: #F0FDF9;
+    border-radius: 16px;
+    padding: 20px 18px 24px 18px !important;
+    border: 1px solid #CCFBF1;
+}
+
+/* ---------- line items table ---------- */
+.li-table { width: 100%; border-collapse: collapse; font-size: 13px; margin-bottom: 14px; }
+.li-table thead tr { background: #1E3A5F; color: #fff; }
+.li-table thead th {
+    padding: 9px 10px; text-align: left; font-weight: 600;
+    font-size: 11px; text-transform: uppercase; letter-spacing: 0.5px;
+}
+.li-table thead th:nth-child(3),
+.li-table thead th:nth-child(4),
+.li-table thead th:nth-child(5) { text-align: right; }
+.li-table tbody tr { border-bottom: 1px solid #E2E8F0; }
+.li-table tbody tr:hover { filter: brightness(0.97); }
+.li-table td { padding: 8px 10px; vertical-align: top; }
+.li-table td:nth-child(3),
+.li-table td:nth-child(4),
+.li-table td:nth-child(5) { text-align: right; font-variant-numeric: tabular-nums; }
+.li-row-low    { background: #F0FFF4; }
+.li-row-amber  { background: #FFFBEB; }
+.li-row-high   { background: #FFF1F2; }
+.li-badge {
+    display: inline-block; padding: 2px 8px; border-radius: 10px;
+    font-size: 10px; font-weight: 700; letter-spacing: 0.3px;
+}
+.li-badge-low   { background: #DCFCE7; color: #166534; }
+.li-badge-amber { background: #FEF3C7; color: #92400E; }
+.li-badge-high  { background: #FFE4E6; color: #9F1239; }
+.li-notes { font-size: 11px; color: #64748B; margin-top: 2px; }
 
 /* ---------- status badges ---------- */
 .badge {
@@ -395,46 +482,305 @@ except ImportError:
     _fitz = None
 
 
-def _extract_highlight_terms(response_text: str) -> list[str]:
+def _extract_highlight_terms_for_pdf(response_text: str, pdf_text: str) -> list[str]:
+    """Find phrases from the AI response that appear verbatim in the PDF, plus key values."""
     terms: set[str] = set()
+    pdf_lower = pdf_text.lower()
+
+    # Sliding window: take n-grams from the response, keep those that exist in the PDF
+    words = response_text.split()
+    for window in range(8, 2, -1):
+        for i in range(len(words) - window + 1):
+            phrase = " ".join(words[i : i + window])
+            if len(phrase) >= 10 and phrase.lower() in pdf_lower:
+                terms.add(phrase)
+
+    # Always highlight monetary amounts, large numbers, and dates from the response
     terms.update(re.findall(r'£[\d,]+(?:\.\d+)?', response_text))
+    terms.update(re.findall(r'€[\d,]+(?:\.\d+)?', response_text))
     terms.update(re.findall(r'\b\d{1,3}(?:,\d{3})+(?:\.\d+)?\b', response_text))
-    terms.update(re.findall(r'\b\d{4,6}\b', response_text))
     terms.update(re.findall(r'\b\d{4}-\d{2}-\d{2}\b', response_text))
-    terms.update(re.findall(r'\b[A-Z][a-z]+(?:\s[A-Z][a-z]+)+\b', response_text))
+
     return [t for t in terms if len(t) >= 3]
 
 
-def _make_highlighted_pdf(pdf_path: str, terms: list[str]) -> bytes:
+def _render_pdf_pages(pdf_path: str, terms: list[str]) -> list[bytes] | None:
+    """Return list of PNG bytes (one per page) with highlights, or None if fitz unavailable."""
     if _fitz is None:
-        with open(pdf_path, "rb") as f:
-            return f.read()
-    doc = _fitz.open(pdf_path)
-    for page in doc:
-        for term in terms:
-            for rect in page.search_for(term):
-                annot = page.add_highlight_annot(rect)
-                annot.set_colors(stroke=(1.0, 0.92, 0.23))
-                annot.update()
-    return doc.tobytes()
+        return None
+    try:
+        doc = _fitz.open(pdf_path)
+        for page in doc:
+            for term in terms:
+                for rect in page.search_for(term):
+                    annot = page.add_highlight_annot(rect)
+                    annot.set_colors(stroke=(1.0, 0.92, 0.23))
+                    annot.update()
+        mat = _fitz.Matrix(1.8, 1.8)
+        return [page.get_pixmap(matrix=mat, alpha=False).tobytes("png") for page in doc]
+    except Exception:
+        return None
+
+
+_PDFJS_VERSION = "3.11.174"
+_PDFJS_CDN = f"https://cdnjs.cloudflare.com/ajax/libs/pdf.js/{_PDFJS_VERSION}"
+
+
+def _pdfjs_preview_html(pdf_bytes: bytes, height: int = 500) -> str:
+    """Render PDF bytes in-browser via PDF.js (no highlights)."""
+    b64 = base64.b64encode(pdf_bytes).decode()
+    return f"""<!DOCTYPE html>
+<html>
+<head>
+<style>
+  * {{ box-sizing: border-box; margin: 0; padding: 0; }}
+  body {{ background: #F8FAFE; font-family: sans-serif; }}
+  #viewer {{ padding: 8px; display: flex; flex-direction: column; gap: 8px; }}
+  canvas {{ display: block; width: 100%; box-shadow: 0 1px 4px rgba(0,0,0,.18); background: #fff; border-radius: 3px; }}
+  #msg {{ padding: 12px; color: #64748B; font-size: 13px; }}
+</style>
+</head>
+<body>
+  <div id="viewer"><div id="msg">Loading PDF…</div></div>
+<script src="{_PDFJS_CDN}/pdf.min.js"></script>
+<script>
+pdfjsLib.GlobalWorkerOptions.workerSrc = '{_PDFJS_CDN}/pdf.worker.min.js';
+const data = atob('{b64}');
+const buf = new Uint8Array(data.length);
+for (let i = 0; i < data.length; i++) buf[i] = data.charCodeAt(i);
+pdfjsLib.getDocument({{ data: buf }}).promise.then(pdf => {{
+  document.getElementById('msg').remove();
+  for (let p = 1; p <= pdf.numPages; p++) {{
+    pdf.getPage(p).then(page => {{
+      const vp = page.getViewport({{ scale: 1.6 }});
+      const canvas = document.createElement('canvas');
+      canvas.height = vp.height;
+      canvas.width  = vp.width;
+      document.getElementById('viewer').appendChild(canvas);
+      page.render({{ canvasContext: canvas.getContext('2d'), viewport: vp }});
+    }});
+  }}
+}}).catch(e => {{ document.getElementById('msg').textContent = 'Preview error: ' + e.message; }});
+</script>
+</body>
+</html>"""
+
+
+def _pdfjs_html(pdf_path: str, terms: list[str]) -> str:
+    """Return an HTML string that renders the PDF with PDF.js and highlights terms."""
+    with open(pdf_path, "rb") as f:
+        b64 = base64.b64encode(f.read()).decode()
+    # Build a JS array of lowercase search strings
+    terms_js = json.dumps([t.lower() for t in terms if len(t) >= 3])
+    return f"""<!DOCTYPE html>
+<html>
+<head>
+<style>
+  * {{ box-sizing: border-box; margin: 0; padding: 0; }}
+  body {{ background: #F8FAFE; font-family: sans-serif; }}
+  #viewer {{ padding: 8px; display: flex; flex-direction: column; gap: 8px; }}
+  canvas {{ display: block; width: 100%; box-shadow: 0 1px 4px rgba(0,0,0,.18); background: #fff; }}
+  #msg {{ padding: 12px; color: #64748B; font-size: 13px; }}
+</style>
+</head>
+<body>
+  <div id="viewer"><div id="msg">Loading PDF…</div></div>
+<script src="{_PDFJS_CDN}/pdf.min.js"></script>
+<script>
+pdfjsLib.GlobalWorkerOptions.workerSrc = '{_PDFJS_CDN}/pdf.worker.min.js';
+const terms = {terms_js};
+
+function highlight(ctx, vp, textItems) {{
+  if (!terms.length) return;
+  ctx.save();
+  ctx.globalAlpha = 0.35;
+  ctx.fillStyle = '#FFE234';
+  textItems.forEach(item => {{
+    const s = item.str.toLowerCase();
+    terms.forEach(t => {{
+      let idx = s.indexOf(t);
+      while (idx !== -1) {{
+        const pre = item.str.slice(0, idx);
+        const charW = item.width / (item.str.length || 1);
+        const x = item.transform[4] + pre.length * charW;
+        const y = vp.height - item.transform[5];
+        const w = t.length * charW;
+        const h = item.height || 12;
+        ctx.fillRect(x * vp.scale, (y - h * 0.85) * vp.scale, w * vp.scale, h * vp.scale);
+        idx = s.indexOf(t, idx + 1);
+      }}
+    }});
+  }});
+  ctx.restore();
+}}
+
+const b64 = "{b64}";
+const bin = atob(b64);
+const bytes = new Uint8Array(bin.length);
+for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+
+pdfjsLib.getDocument({{data: bytes}}).promise.then(pdf => {{
+  document.getElementById('msg').remove();
+  const render = n => pdf.getPage(n).then(page => {{
+    const vp = page.getViewport({{scale: 1.6}});
+    const canvas = document.createElement('canvas');
+    canvas.width = vp.width;
+    canvas.height = vp.height;
+    document.getElementById('viewer').appendChild(canvas);
+    const ctx = canvas.getContext('2d');
+    page.render({{canvasContext: ctx, viewport: vp}}).promise.then(() =>
+      page.getTextContent().then(tc => {{
+        highlight(ctx, vp, tc.items);
+        if (n < pdf.numPages) render(n + 1);
+      }})
+    );
+  }});
+  render(1);
+}}).catch(e => {{
+  document.getElementById('viewer').innerHTML =
+    '<div id="msg">Could not render PDF: ' + e.message + '</div>';
+}});
+</script>
+</body>
+</html>"""
+
+
+def _build_line_items_excel(line_items: list[dict], parsed: dict, analysis: dict) -> bytes:
+    import openpyxl
+    from openpyxl.styles import Alignment, Font, PatternFill
+    from openpyxl.utils import get_column_letter
+
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "Line Items"
+
+    # ── Title row
+    ws.merge_cells("A1:J1")
+    ws["A1"] = f"Quote Analysis — {parsed.get('supplier', 'Unknown')} — {parsed.get('description', '')}"
+    ws["A1"].font = Font(bold=True, size=12, color="1A237E")
+    ws["A1"].fill = PatternFill("solid", fgColor="E3F2FD")
+    ws["A1"].alignment = Alignment(horizontal="center", vertical="center")
+    ws.row_dimensions[1].height = 22
+
+    # ── Header row
+    headers = ["#", "Description", "Unit", "Quoted (£)", "% of Total",
+               "Market Est. (£)", "Variance (£)", "Variance (%)", "Risk", "Notes"]
+    for col, h in enumerate(headers, 1):
+        c = ws.cell(row=2, column=col, value=h)
+        c.font = Font(bold=True, color="FFFFFF", size=10)
+        c.fill = PatternFill("solid", fgColor="0072BC")
+        c.alignment = Alignment(horizontal="center", vertical="center")
+    ws.row_dimensions[2].height = 18
+
+    fills = {
+        "Low":   PatternFill("solid", fgColor="DCFCE7"),
+        "Amber": PatternFill("solid", fgColor="FEF9C3"),
+        "High":  PatternFill("solid", fgColor="FEE2E2"),
+    }
+    total_quoted = sum(item.get("amount", 0) for item in line_items) or 1
+
+    for i, item in enumerate(line_items, 1):
+        row = i + 2
+        amount = item.get("amount", 0)
+        mkt    = item.get("market_estimate", 0)
+        var    = amount - mkt
+        var_pct = (var / mkt) if mkt > 0 else 0
+        pct_tot = amount / total_quoted
+        risk = item.get("risk_level", "Low")
+        fill = fills.get(risk, fills["Low"])
+
+        values = [i, item.get("description", ""), item.get("unit", "lump sum"),
+                  amount, pct_tot, mkt, var, var_pct, risk, item.get("notes", "")]
+        fmts   = [None, None, None, '£#,##0', '0.0%', '£#,##0', '£#,##0', '0.0%', None, None]
+        aligns = ["center","left","center","center","center","center","center","center","center","left"]
+
+        for col, (val, fmt, aln) in enumerate(zip(values, fmts, aligns), 1):
+            c = ws.cell(row=row, column=col, value=val)
+            c.fill = fill
+            c.alignment = Alignment(horizontal=aln, vertical="center", wrap_text=(col == 10))
+            if fmt:
+                c.number_format = fmt
+        ws.row_dimensions[row].height = 16
+
+    # ── Totals row
+    tr = len(line_items) + 3
+    ws.cell(row=tr, column=1, value="TOTAL").font = Font(bold=True)
+    tc = ws.cell(row=tr, column=4, value=total_quoted)
+    tc.font = Font(bold=True); tc.number_format = '£#,##0'
+    tp = ws.cell(row=tr, column=5, value=1.0)
+    tp.font = Font(bold=True); tp.number_format = '0.0%'
+
+    for col, w in enumerate([4, 36, 14, 14, 12, 14, 13, 12, 9, 46], 1):
+        ws.column_dimensions[get_column_letter(col)].width = w
+
+    # ── KPI summary sheet
+    ws2 = wb.create_sheet("Benchmark KPIs")
+    for col, h in enumerate(["KPI", "Submitted", "Benchmark Reference", "Status"], 1):
+        c = ws2.cell(row=1, column=col, value=h)
+        c.font = Font(bold=True, color="FFFFFF")
+        c.fill = PatternFill("solid", fgColor="0072BC")
+        c.alignment = Alignment(horizontal="center")
+
+    sp = analysis.get("supplier_premium_pct")
+    kpis = [
+        ("vs. Market Avg",      f"{analysis['new_quote_vs_mean_pct']:+.1f}%",
+         "< 0% = below market avg",
+         "High" if analysis['new_quote_vs_mean_pct'] > 20 else ("Amber" if analysis['new_quote_vs_mean_pct'] > 0 else "Low")),
+        ("Percentile Rank",     f"{analysis['new_quote_percentile']:.0f}th",
+         "< 33rd = competitive",
+         "High" if analysis['new_quote_percentile'] > 75 else ("Amber" if analysis['new_quote_percentile'] > 33 else "Low")),
+        ("Z-Score",             f"{analysis['new_quote_z_score']:+.2f}σ",
+         "|Z| < 1.0 = normal range",
+         "High" if abs(analysis['new_quote_z_score']) > 2 else ("Amber" if abs(analysis['new_quote_z_score']) > 1 else "Low")),
+        ("Supplier Premium",    f"{sp:+.1f}%" if sp is not None else "N/A",
+         "< 0% = below own avg",
+         "High" if (sp or 0) > 25 else ("Amber" if (sp or 0) > 0 else "Low")),
+        ("vs. Historical Best", f"{analysis['best_price_distance_pct']:+.1f}%",
+         "< 20% = near best price",
+         "High" if analysis['best_price_distance_pct'] > 40 else ("Amber" if analysis['best_price_distance_pct'] > 20 else "Low")),
+    ]
+    kpi_fills = {"Low": "DCFCE7", "Amber": "FEF9C3", "High": "FEE2E2"}
+    for row, (label, val, ref, status) in enumerate(kpis, 2):
+        ws2.cell(row=row, column=1, value=label)
+        ws2.cell(row=row, column=2, value=val).alignment = Alignment(horizontal="center")
+        ws2.cell(row=row, column=3, value=ref)
+        c = ws2.cell(row=row, column=4, value=status)
+        c.fill = PatternFill("solid", fgColor=kpi_fills.get(status, "FFFFFF"))
+        c.alignment = Alignment(horizontal="center")
+    for col, w in enumerate([26, 16, 28, 12], 1):
+        ws2.column_dimensions[get_column_letter(col)].width = w
+
+    out = io.BytesIO()
+    wb.save(out)
+    return out.getvalue()
 
 
 def _extract_sources(response_text: str) -> dict:
     sources: dict = {"pdfs": [], "quotes": [], "response_text": response_text}
     cited_pdfs = {p.lower() for p in re.findall(r"\b([\w\-]+\.pdf)\b", response_text, re.IGNORECASE)}
+    response_lower = response_text.lower()
     for fname in sorted(os.listdir(_DB_DIR)):
         if not fname.lower().endswith(".pdf"):
             continue
+        fpath = os.path.join(_DB_DIR, fname)
         stem = re.sub(r"_\d{8}", "", fname[:-4]).lower()
-        if fname.lower() in cited_pdfs or stem in response_text.lower():
-            fpath = os.path.join(_DB_DIR, fname)
-            try:
-                reader = PdfReader(fpath)
-                text = "\n".join(p.extract_text() or "" for p in reader.pages).strip()
-                if text:
-                    sources["pdfs"].append({"filename": fname, "text": text, "path": fpath})
-            except Exception:
-                pass
+        try:
+            reader = PdfReader(fpath)
+            text = "\n".join(p.extract_text() or "" for p in reader.pages).strip()
+        except Exception:
+            continue
+        if not text:
+            continue
+        # Match by explicit filename/stem citation OR by content overlap (5-word phrase)
+        name_match = fname.lower() in cited_pdfs or stem in response_lower
+        if not name_match:
+            pdf_words = text.split()
+            name_match = any(
+                " ".join(pdf_words[i : i + 5]).lower() in response_lower
+                for i in range(0, max(1, len(pdf_words) - 4), 3)
+            )
+        if name_match:
+            sources["pdfs"].append({"filename": fname, "text": text, "path": fpath})
     cited_ids = set(re.findall(r"\b(Q\d{3,4})\b", response_text))
     if cited_ids:
         sources["quotes"] = [q for q in load_quotes() if q.get("id") in cited_ids]
@@ -467,16 +813,6 @@ st.markdown("""
 # ── Tabs ───────────────────────────────────────────────────────────────────────
 tab1, tab2 = st.tabs(["💬  Quote Chatbot", "📊  Quote Analysis"])
 
-CATEGORIES = [
-    "Water Treatment Infrastructure",
-    "Pipeline Infrastructure",
-    "Pumping Infrastructure",
-    "Network Rehabilitation",
-    "Civil & Structural Works",
-    "Mechanical & Electrical",
-    "Environmental & Compliance",
-    "Project Management & Consulting",
-]
 
 # ── Tab 1 : Chatbot ────────────────────────────────────────────────────────────
 with tab1:
@@ -571,24 +907,21 @@ with tab1:
             """, unsafe_allow_html=True)
         else:
             response_text = sources.get("response_text", "")
-            terms = _extract_highlight_terms(response_text)
 
             for pdf in sources["pdfs"]:
                 st.markdown(
                     f'<div class="src-file-header">📄 &nbsp;{pdf["filename"]}</div>',
                     unsafe_allow_html=True,
                 )
-                pdf_bytes = _make_highlighted_pdf(pdf["path"], terms)
-                b64 = base64.b64encode(pdf_bytes).decode()
-                components.html(
-                    f"""<html><body style="margin:0;padding:0;background:#F8FAFE">
-                    <embed src="data:application/pdf;base64,{b64}"
-                           type="application/pdf"
-                           width="100%" height="430px"
-                           style="border:none;border-radius:0 0 10px 10px;display:block">
-                    </body></html>""",
-                    height=438,
-                )
+                terms = _extract_highlight_terms_for_pdf(response_text, pdf["text"])
+                pages = _render_pdf_pages(pdf["path"], terms)
+                if pages:
+                    for img_bytes in pages:
+                        st.image(img_bytes, use_container_width=True)
+                else:
+                    # Fallback: render via PDF.js in the browser (no native deps required)
+                    html = _pdfjs_html(pdf["path"], terms)
+                    components.html(html, height=600, scrolling=True)
 
             for q in sources["quotes"]:
                 price = q.get("total_price", 0)
@@ -620,63 +953,40 @@ with tab2:
         <div class="section-divider"></div>
         """, unsafe_allow_html=True)
 
-        input_mode = st.radio(
-            "Input method",
-            ["✏️  Paste text", "📎  Upload file"],
-            horizontal=True,
+        quote_text = ""
+        uploaded = st.file_uploader(
+            "Upload a quote document",
+            type=["txt", "json", "csv", "pdf"],
             label_visibility="collapsed",
         )
-
-        quote_text = ""
-        if "Paste" in input_mode:
-            st.markdown('<div class="upload-panel">', unsafe_allow_html=True)
-            quote_text = st.text_area(
-                "Quote content",
-                height=200,
-                placeholder="Paste quote content here — supplier name, scope of works, line items, prices, date…",
-                label_visibility="collapsed",
-            )
-            st.markdown("</div>", unsafe_allow_html=True)
-        else:
-            uploaded = st.file_uploader(
-                "Upload a quote document",
-                type=["txt", "json", "csv", "pdf"],
-                label_visibility="collapsed",
-            )
-            if uploaded:
-                try:
-                    raw_bytes = uploaded.read()
-                    if len(raw_bytes) == 0:
-                        st.error("The uploaded file is empty.")
-                    elif uploaded.name.lower().endswith(".pdf"):
-                        reader = PdfReader(io.BytesIO(raw_bytes))
-                        quote_text = "\n".join(
-                            page.extract_text() or "" for page in reader.pages
-                        ).strip()
-                        if not quote_text:
-                            st.error("Could not extract text from this PDF — it may be image-based.")
-                        else:
-                            with st.expander("📄 Extracted PDF content", expanded=False):
-                                st.text_area("", quote_text, height=180, label_visibility="collapsed")
-                            st.success(f"PDF parsed — {len(quote_text):,} characters extracted")
+        if uploaded:
+            try:
+                raw_bytes = uploaded.read()
+                if len(raw_bytes) == 0:
+                    st.error("The uploaded file is empty.")
+                elif uploaded.name.lower().endswith(".pdf"):
+                    reader = PdfReader(io.BytesIO(raw_bytes))
+                    quote_text = "\n".join(
+                        page.extract_text() or "" for page in reader.pages
+                    ).strip()
+                    if not quote_text:
+                        st.error("Could not extract text from this PDF — it may be image-based.")
                     else:
-                        quote_text = raw_bytes.decode("utf-8")
-                        with st.expander("📄 File content preview", expanded=False):
-                            st.text_area("", quote_text, height=180, label_visibility="collapsed")
-                except Exception as e:
-                    st.error(f"Could not read file: {e}")
+                        st.success(f"✅ PDF ready — {len(quote_text):,} characters extracted")
+                        with st.expander("📄 PDF preview", expanded=True):
+                            components.html(
+                                _pdfjs_preview_html(raw_bytes),
+                                height=520,
+                                scrolling=True,
+                            )
+                else:
+                    quote_text = raw_bytes.decode("utf-8")
+                    with st.expander("📄 File content preview", expanded=False):
+                        st.text_area("", quote_text, height=180, label_visibility="collapsed")
+            except Exception as e:
+                st.error(f"Could not read file: {e}")
 
         st.markdown('<div style="height:10px"></div>', unsafe_allow_html=True)
-
-        cat_col, _ = st.columns([1, 0.01])
-        with cat_col:
-            category = st.selectbox(
-                "Work Category",
-                CATEGORIES,
-                help="Select the AMP8 capital work category that best matches this quote.",
-            )
-
-        st.markdown('<div style="height:8px"></div>', unsafe_allow_html=True)
         run_btn = st.button(
             "🔍  Run Analysis",
             type="primary",
@@ -688,8 +998,7 @@ with tab2:
             parsed = None
             with st.spinner("Extracting structured data from quote…"):
                 try:
-                    parsed = parse_quote(quote_text, category)
-                    parsed["category"] = category
+                    parsed = parse_quote(quote_text)
                 except json.JSONDecodeError:
                     st.error("Could not parse quote into structured data. Try adding more detail.")
                 except Exception as e:
@@ -698,10 +1007,39 @@ with tab2:
             if parsed:
                 with st.expander("✅ Parsed quote data", expanded=False):
                     st.json(parsed)
-                with st.spinner("Benchmarking against historical data…"):
-                    analysis = analyze_quote(parsed)
+                comparable_result = {}
+                with st.spinner("Finding comparable quotes in database…"):
+                    try:
+                        comparable_result = find_comparable_quotes(quote_text, parsed)
+                    except Exception:
+                        comparable_result = {}
+                comparable_ids = comparable_result.get("comparable_ids") or None
+                with st.spinner("Benchmarking against comparable quotes…"):
+                    analysis = analyze_quote(parsed, comparable_ids=comparable_ids)
+                analysis["comparable_reasoning"] = comparable_result.get("reasoning", "")
+                line_items = []
+                if "error" not in analysis:
+                    with st.spinner("Extracting line items…"):
+                        try:
+                            line_items = parse_line_items(
+                                quote_text,
+                                parsed.get("description", ""),
+                                analysis["new_quote_price"],
+                                analysis["inflation_adjusted_mean"],
+                            )
+                        except Exception:
+                            line_items = []
+                    with st.spinner("Running procurement agent analysis…"):
+                        try:
+                            agent_data = build_agent_summary(parsed, analysis, line_items)
+                        except Exception:
+                            agent_data = {}
+                else:
+                    agent_data = {}
                 st.session_state["analysis"] = analysis
                 st.session_state["parsed_quote"] = parsed
+                st.session_state["line_items"] = line_items
+                st.session_state["agent_summary"] = agent_data
                 st.rerun()
 
         # ── Database overview when idle ────────────────────────────────────────
@@ -716,32 +1054,36 @@ with tab2:
             """, unsafe_allow_html=True)
             try:
                 df = get_dataframe()
-                total_spend = df["total_price"].sum()
-                n_quotes    = len(df)
-                n_suppliers = df["supplier"].nunique()
-                accepted_pct = (df["status"] == "accepted").mean() * 100
+                total_spend  = df["total_price"].sum()
+                n_quotes     = len(df)
+                n_suppliers  = df["supplier"].nunique()
+                accepted_pct = (df["status"] == "accepted").mean() * 100 if "status" in df.columns else 0
 
                 st.markdown(f"""
-                <div class="kpi-grid">
-                  <div class="kpi-card blue">
-                    <div class="kpi-icon">💷</div>
-                    <div class="kpi-label">Total Spend</div>
-                    <div class="kpi-value">£{total_spend/1e6:.1f}M</div>
+                <div class="kpi5-grid">
+                  <div class="kpi5-card neutral">
+                    <div class="kpi5-flag">💷</div>
+                    <div class="kpi5-label">Total Spend</div>
+                    <div class="kpi5-value">£{total_spend/1e6:.1f}M</div>
+                    <div class="kpi5-sub">across all quotes</div>
                   </div>
-                  <div class="kpi-card teal">
-                    <div class="kpi-icon">📋</div>
-                    <div class="kpi-label">Quotes</div>
-                    <div class="kpi-value">{n_quotes}</div>
+                  <div class="kpi5-card neutral">
+                    <div class="kpi5-flag">📋</div>
+                    <div class="kpi5-label">Quotes</div>
+                    <div class="kpi5-value">{n_quotes}</div>
+                    <div class="kpi5-sub">in database</div>
                   </div>
-                  <div class="kpi-card green">
-                    <div class="kpi-icon">🏢</div>
-                    <div class="kpi-label">Contractors</div>
-                    <div class="kpi-value">{n_suppliers}</div>
+                  <div class="kpi5-card neutral">
+                    <div class="kpi5-flag">🏢</div>
+                    <div class="kpi5-label">Contractors</div>
+                    <div class="kpi5-value">{n_suppliers}</div>
+                    <div class="kpi5-sub">unique suppliers</div>
                   </div>
-                  <div class="kpi-card amber">
-                    <div class="kpi-icon">✅</div>
-                    <div class="kpi-label">Accepted</div>
-                    <div class="kpi-value">{accepted_pct:.0f}%</div>
+                  <div class="kpi5-card neutral">
+                    <div class="kpi5-flag">✅</div>
+                    <div class="kpi5-label">Accepted</div>
+                    <div class="kpi5-value">{accepted_pct:.0f}%</div>
+                    <div class="kpi5-sub">acceptance rate</div>
                   </div>
                 </div>
                 """, unsafe_allow_html=True)
@@ -751,56 +1093,106 @@ with tab2:
     # ── Right panel: results ───────────────────────────────────────────────────
     with col_results:
         if "analysis" in st.session_state:
-            analysis = st.session_state["analysis"]
-            parsed   = st.session_state["parsed_quote"]
+            analysis   = st.session_state["analysis"]
+            parsed     = st.session_state["parsed_quote"]
+            agent_data = st.session_state.get("agent_summary", {})
+            line_items = st.session_state.get("line_items", [])
 
             if "error" in analysis:
                 st.error(analysis["error"])
             else:
-                pct = analysis["new_quote_vs_mean_pct"]
+                # ── Agent Summary (top of dashboard) ──────────────────────────
+                summary_md = agent_data.get("summary", "")
+                if summary_md:
+                    st.markdown("""
+                    <div class="agent-summary-card">
+                      <div class="agent-summary-header">
+                        <span class="agent-summary-title">🤖 Procurement Agent Summary</span>
+                        <span class="agent-summary-badge">AI ANALYSIS</span>
+                      </div>
+                    </div>""", unsafe_allow_html=True)
+                    st.markdown(summary_md)
 
-                # ── Metric cards ───────────────────────────────────────────────
+                # ── 5 KPI cards ────────────────────────────────────────────────
                 st.markdown("""
                 <div class="section-header">
                   <div class="section-icon blue">📊</div>
-                  <div><div class="section-title">Benchmark Summary</div></div>
+                  <div><div class="section-title">Benchmark KPIs</div></div>
                 </div>
                 <div class="section-divider"></div>
                 """, unsafe_allow_html=True)
 
-                delta_class = "delta-pos" if pct < 0 else ("delta-neu" if abs(pct) < 5 else "delta-neg")
-                delta_sign  = "▼" if pct < 0 else "▲"
-                pct_label   = f'<span class="{delta_class}">{delta_sign} {abs(pct):.1f}% vs benchmark avg</span>'
+                def _kpi_class(val, thresholds, invert=False):
+                    lo, hi = thresholds
+                    if invert:
+                        return "green" if val <= lo else ("amber" if val <= hi else "red")
+                    return "green" if val < lo else ("amber" if val < hi else "red")
 
-                pct_rank = analysis["new_quote_percentile"]
-                if pct_rank <= 33:
-                    box_class, rank_note = "good",    "Low-cost quartile"
-                elif pct_rank <= 66:
-                    box_class, rank_note = "neutral",  "Mid-range"
-                else:
-                    box_class, rank_note = "bad",  "High-cost quartile"
+                pct        = analysis["new_quote_vs_mean_pct"]
+                rank       = analysis["new_quote_percentile"]
+                z          = analysis["new_quote_z_score"]
+                sp         = analysis.get("supplier_premium_pct")
+                best_dist  = analysis["best_price_distance_pct"]
+
+                c1 = _kpi_class(pct,       (0, 20))
+                c2 = _kpi_class(rank,      (33, 75))
+                c3 = _kpi_class(abs(z),    (1, 2))
+                c4 = _kpi_class(sp or 0,   (0, 25)) if sp is not None else "neutral"
+                c5 = _kpi_class(best_dist, (20, 40))
+
+                flag = {"green": "✅", "amber": "⚠️", "red": "🔴", "neutral": "➖"}
+                sp_val = f"{sp:+.1f}%" if sp is not None else "N/A"
+                sp_sub = "vs supplier's own avg" if sp is not None else "no prior data"
 
                 st.markdown(f"""
-                <div class="metric-row">
-                  <div class="metric-box neutral">
-                    <div class="metric-box-label">Submitted Quote</div>
-                    <div class="metric-box-value">£{analysis['new_quote_price']:,.0f}</div>
-                    <div class="metric-box-delta">&nbsp;</div>
+                <div class="kpi5-grid">
+                  <div class="kpi5-card {c1}">
+                    <div class="kpi5-flag">{flag[c1]}</div>
+                    <div class="kpi5-label">vs Market Avg</div>
+                    <div class="kpi5-value">{pct:+.1f}%</div>
+                    <div class="kpi5-sub">inflation-adj. avg</div>
                   </div>
-                  <div class="metric-box {'good' if pct < 0 else 'bad'}">
-                    <div class="metric-box-label">Benchmark Avg (adj.)</div>
-                    <div class="metric-box-value">£{analysis['inflation_adjusted_mean']:,.0f}</div>
-                    <div class="metric-box-delta">{pct_label}</div>
+                  <div class="kpi5-card {c2}">
+                    <div class="kpi5-flag">{flag[c2]}</div>
+                    <div class="kpi5-label">Percentile Rank</div>
+                    <div class="kpi5-value">{rank:.0f}<sup style="font-size:12px">th</sup></div>
+                    <div class="kpi5-sub">of {analysis['sample_size']} quotes</div>
                   </div>
-                  <div class="metric-box {box_class}">
-                    <div class="metric-box-label">Percentile Rank</div>
-                    <div class="metric-box-value">{pct_rank:.0f}<sup style="font-size:13px">th</sup></div>
-                    <div class="metric-box-delta" style="color:#64748B">{rank_note}</div>
+                  <div class="kpi5-card {c3}">
+                    <div class="kpi5-flag">{flag[c3]}</div>
+                    <div class="kpi5-label">Z-Score</div>
+                    <div class="kpi5-value">{z:+.2f}<span style="font-size:13px">σ</span></div>
+                    <div class="kpi5-sub">statistical deviation</div>
+                  </div>
+                  <div class="kpi5-card {c4}">
+                    <div class="kpi5-flag">{flag[c4]}</div>
+                    <div class="kpi5-label">Supplier Premium</div>
+                    <div class="kpi5-value">{sp_val}</div>
+                    <div class="kpi5-sub">{sp_sub}</div>
+                  </div>
+                  <div class="kpi5-card {c5}">
+                    <div class="kpi5-flag">{flag[c5]}</div>
+                    <div class="kpi5-label">vs Best Price</div>
+                    <div class="kpi5-value">{best_dist:+.1f}%</div>
+                    <div class="kpi5-sub">above historical best</div>
                   </div>
                 </div>
                 """, unsafe_allow_html=True)
 
-                # ── Contractor benchmark chart ──────────────────────────────────
+                # ── Additional KPIs from agent ─────────────────────────────────
+                extra_kpis = agent_data.get("additional_kpis", [])
+                if extra_kpis:
+                    cards_html = "".join(f"""
+                      <div class="kpi5-card {k.get('status','neutral')}">
+                        <div class="kpi5-flag">{flag.get(k.get('status','neutral'),'➖')}</div>
+                        <div class="kpi5-label">{k.get('label','')}</div>
+                        <div class="kpi5-value" style="font-size:17px">{k.get('value','')}</div>
+                        <div class="kpi5-sub">{k.get('note','')}</div>
+                      </div>""" for k in extra_kpis)
+                    st.markdown(f'<div class="kpi5-grid">{cards_html}</div>',
+                                unsafe_allow_html=True)
+
+                # ── Contractor benchmark chart ─────────────────────────────────
                 st.markdown("""
                 <div class="section-header">
                   <div class="section-icon teal">🏗️</div>
@@ -825,26 +1217,21 @@ with tab2:
                 ))
                 fig.add_hline(
                     y=analysis["new_quote_price"],
-                    line_dash="dash",
-                    line_color="#E53935",
-                    line_width=2,
+                    line_dash="dash", line_color="#E53935", line_width=2,
                     annotation_text=f"  Submitted  £{analysis['new_quote_price']:,.0f}",
                     annotation_position="top left",
                     annotation_font=dict(color="#E53935", size=11),
                 )
                 fig.update_layout(
-                    plot_bgcolor="#F8FAFE",
-                    paper_bgcolor="#F8FAFE",
+                    plot_bgcolor="#F8FAFE", paper_bgcolor="#F8FAFE",
                     xaxis=dict(tickangle=-20, tickfont=dict(size=11), gridcolor="#E2ECF8"),
                     yaxis=dict(title="Price (GBP)", tickfont=dict(size=11),
                                gridcolor="#E2ECF8", tickprefix="£"),
-                    height=290,
-                    margin=dict(t=30, b=10, l=10, r=10),
-                    showlegend=False,
+                    height=290, margin=dict(t=30, b=10, l=10, r=10), showlegend=False,
                 )
                 st.plotly_chart(fig, use_container_width=True)
 
-                # ── Distribution strip ─────────────────────────────────────────
+                # ── Historical price distribution ──────────────────────────────
                 st.markdown("""
                 <div class="section-header">
                   <div class="section-icon green">📈</div>
@@ -856,35 +1243,23 @@ with tab2:
                 hist_df = pd.DataFrame(analysis["historical_quotes"])
                 fig2 = go.Figure()
                 fig2.add_trace(go.Histogram(
-                    x=hist_df["adjusted_price"],
-                    nbinsx=12,
-                    marker_color="#0097A7",
-                    opacity=0.75,
-                    name="Historical (adj.)",
+                    x=hist_df["adjusted_price"], nbinsx=12,
+                    marker_color="#0097A7", opacity=0.75, name="Historical (adj.)",
                 ))
-                fig2.add_vline(
-                    x=analysis["new_quote_price"],
+                fig2.add_vline(x=analysis["new_quote_price"],
                     line_dash="dash", line_color="#E53935", line_width=2,
-                    annotation_text="Submitted",
-                    annotation_position="top right",
-                    annotation_font=dict(color="#E53935", size=11),
-                )
-                fig2.add_vline(
-                    x=analysis["inflation_adjusted_mean"],
+                    annotation_text="Submitted", annotation_position="top right",
+                    annotation_font=dict(color="#E53935", size=11))
+                fig2.add_vline(x=analysis["inflation_adjusted_mean"],
                     line_dash="dot", line_color="#0072BC", line_width=2,
-                    annotation_text="Avg",
-                    annotation_position="top left",
-                    annotation_font=dict(color="#0072BC", size=11),
-                )
+                    annotation_text="Avg", annotation_position="top left",
+                    annotation_font=dict(color="#0072BC", size=11))
                 fig2.update_layout(
-                    plot_bgcolor="#F8FAFE",
-                    paper_bgcolor="#F8FAFE",
+                    plot_bgcolor="#F8FAFE", paper_bgcolor="#F8FAFE",
                     xaxis=dict(title="Inflation-Adjusted Price (GBP)", tickprefix="£",
                                tickfont=dict(size=11), gridcolor="#E2ECF8"),
                     yaxis=dict(title="Count", tickfont=dict(size=11), gridcolor="#E2ECF8"),
-                    height=220,
-                    margin=dict(t=20, b=10, l=10, r=10),
-                    showlegend=False,
+                    height=220, margin=dict(t=20, b=10, l=10, r=10), showlegend=False,
                 )
                 st.plotly_chart(fig2, use_container_width=True)
 
@@ -897,67 +1272,82 @@ with tab2:
                     st.success("✅  No outliers detected in historical benchmark data.")
 
                 # ── Historical quotes table ────────────────────────────────────
+                reasoning = analysis.get("comparable_reasoning", "")
+                ids_label = ", ".join(analysis.get("comparable_ids", []))
+                if reasoning:
+                    st.info(f"🔍 **Comparable quotes used:** {ids_label}  \n{reasoning}")
                 with st.expander(
-                    f"📋  Historical quotes — {analysis['category']}  ({analysis['sample_size']} records)"
+                    f"📋  Comparable quotes  ({analysis['sample_size']} record(s))"
                 ):
                     st.dataframe(pd.DataFrame(analysis["historical_quotes"]), use_container_width=True)
 
-                # ── AI Insights ────────────────────────────────────────────────
+                # ── Line items Excel download ──────────────────────────────────
                 st.markdown("""
-                <div class="section-header" style="margin-top:20px">
-                  <div class="section-icon amber">🤖</div>
-                  <div><div class="section-title">AI Procurement Insights</div></div>
+                <div class="section-header" style="margin-top:8px">
+                  <div class="section-icon green">📥</div>
+                  <div><div class="section-title">Line Items Analysis</div></div>
                 </div>
                 <div class="section-divider"></div>
                 """, unsafe_allow_html=True)
 
-                insight_prompt = f"""You are a capital project procurement specialist for a UK water company \
-operating under Ofwat's AMP8 regulatory framework.
+                if line_items:
+                    _risk_row  = {"Low": "li-row-low", "Amber": "li-row-amber", "High": "li-row-high"}
+                    _risk_badge = {"Low": "li-badge-low", "Amber": "li-badge-amber", "High": "li-badge-high"}
+                    _risk_icon  = {"Low": "✅", "Amber": "⚠️", "High": "🔴"}
+                    rows_html = ""
+                    for it in line_items:
+                        risk   = it.get("risk_level", "Low")
+                        amt    = it.get("amount", 0) or 0
+                        mkt    = it.get("market_estimate", 0) or 0
+                        var    = amt - mkt
+                        var_sign = "+" if var >= 0 else ""
+                        row_cls  = _risk_row.get(risk, "li-row-low")
+                        bdg_cls  = _risk_badge.get(risk, "li-badge-low")
+                        icon     = _risk_icon.get(risk, "")
+                        rows_html += f"""
+                        <tr class="{row_cls}">
+                          <td>
+                            <div style="font-weight:500;color:#1E293B">{it.get('description','')}</div>
+                            <div class="li-notes">{it.get('notes','')}</div>
+                          </td>
+                          <td style="color:#64748B;font-size:12px">{it.get('unit','')}</td>
+                          <td>£{amt:,.0f}</td>
+                          <td>£{mkt:,.0f}</td>
+                          <td style="{'color:#DC2626;font-weight:600' if var > 0 else 'color:#16A34A;font-weight:600'}">{var_sign}£{var:,.0f}</td>
+                          <td><span class="li-badge {bdg_cls}">{icon} {risk}</span></td>
+                        </tr>"""
+                    st.markdown(f"""
+                    <table class="li-table">
+                      <thead>
+                        <tr>
+                          <th style="width:34%">Description</th>
+                          <th style="width:10%">Unit</th>
+                          <th style="width:13%">Quoted (£)</th>
+                          <th style="width:14%">Market Est. (£)</th>
+                          <th style="width:13%">Variance (£)</th>
+                          <th style="width:10%">Risk</th>
+                        </tr>
+                      </thead>
+                      <tbody>{rows_html}</tbody>
+                    </table>
+                    """, unsafe_allow_html=True)
 
-Analyse the following capital project quote and provide exactly 4 concise, numbered insights \
-tailored to the water industry context.
+                    excel_bytes = _build_line_items_excel(line_items, parsed, analysis)
+                    supplier_slug = re.sub(r"[^\w]", "_", parsed.get("supplier", "quote"))
+                    st.download_button(
+                        "📥  Download Line Items Analysis (Excel)",
+                        data=excel_bytes,
+                        file_name=f"quote_analysis_{supplier_slug}.xlsx",
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                        use_container_width=True,
+                    )
+                else:
+                    st.caption("Line item breakdown unavailable for this quote.")
 
-Submitted quote:
-{json.dumps(parsed, indent=2)}
-
-Benchmark analysis results:
-- Work category: {analysis['category']}
-- Submitted price: £{analysis['new_quote_price']:,.0f}
-- Inflation-adjusted benchmark average: £{analysis['inflation_adjusted_mean']:,.0f}
-- Inflation-adjusted benchmark median: £{analysis['inflation_adjusted_median']:,.0f}
-- Position vs. benchmark average: {pct:+.1f}%
-- Percentile rank among historical quotes: {analysis['new_quote_percentile']:.0f}th
-- Z-score: {analysis['new_quote_z_score']}
-- Historical sample size: {analysis['sample_size']} quotes
-- Outliers in dataset: {len(analysis['outliers'])}
-- Contractor benchmark (inflation-adjusted): {json.dumps(analysis['benchmark'], indent=2)}
-
-Address the following in your 4 insights:
-1. Price competitiveness vs. AMP8 water sector benchmarks
-2. Contractor/supplier value assessment based on historical performance
-3. Regulatory or delivery risk flags relevant to water capital projects \
-(e.g. Ofwat totex, CDM, WINEP obligations)
-4. Specific negotiation or procurement recommendations
-
-Be direct, use numbers, and reference contractor names and water industry standards where relevant."""
-
-                stream = client.chat.completions.create(
-                    model=DEPLOYMENT,
-                    messages=[{"role": "user", "content": insight_prompt}],
-                    stream=True,
-                    temperature=0.4,
-                    max_completion_tokens=600,
-                )
-                insight_text = "".join(_stream(stream))
-                st.markdown(
-                    f'<div class="insight-card"><p>{insight_text.replace(chr(10), "<br>")}</p></div>',
-                    unsafe_allow_html=True,
-                )
-
-                st.markdown('<div style="height:6px"></div>', unsafe_allow_html=True)
+                st.markdown('<div style="height:8px"></div>', unsafe_allow_html=True)
                 if st.button("🔄  Clear analysis", use_container_width=False):
-                    del st.session_state["analysis"]
-                    del st.session_state["parsed_quote"]
+                    for k in ("analysis", "parsed_quote", "line_items", "agent_summary"):
+                        st.session_state.pop(k, None)
                     st.rerun()
 
         else:
@@ -978,55 +1368,60 @@ Be direct, use numbers, and reference contractor names and water industry standa
                 accepted_pct = (df["status"] == "accepted").mean() * 100
 
                 st.markdown(f"""
-                <div class="kpi-grid">
-                  <div class="kpi-card blue">
-                    <div class="kpi-icon">💷</div>
-                    <div class="kpi-label">Total Portfolio Spend</div>
-                    <div class="kpi-value">£{total_spend/1e6:.1f}M</div>
-                    <div class="kpi-delta">All categories · all years</div>
+                <div class="kpi5-grid">
+                  <div class="kpi5-card neutral">
+                    <div class="kpi5-flag">💷</div>
+                    <div class="kpi5-label">Total Portfolio Spend</div>
+                    <div class="kpi5-value">£{total_spend/1e6:.1f}M</div>
+                    <div class="kpi5-sub">all quotes · all years</div>
                   </div>
-                  <div class="kpi-card teal">
-                    <div class="kpi-icon">📋</div>
-                    <div class="kpi-label">Quotes on Record</div>
-                    <div class="kpi-value">{n_quotes}</div>
-                    <div class="kpi-delta">Across {df['category'].nunique()} categories</div>
+                  <div class="kpi5-card neutral">
+                    <div class="kpi5-flag">📋</div>
+                    <div class="kpi5-label">Quotes on Record</div>
+                    <div class="kpi5-value">{n_quotes}</div>
+                    <div class="kpi5-sub">in database</div>
                   </div>
-                  <div class="kpi-card green">
-                    <div class="kpi-icon">🏢</div>
-                    <div class="kpi-label">Contractors</div>
-                    <div class="kpi-value">{n_suppliers}</div>
-                    <div class="kpi-delta">Active supply chain</div>
+                  <div class="kpi5-card neutral">
+                    <div class="kpi5-flag">🏢</div>
+                    <div class="kpi5-label">Contractors</div>
+                    <div class="kpi5-value">{n_suppliers}</div>
+                    <div class="kpi5-sub">active supply chain</div>
                   </div>
-                  <div class="kpi-card amber">
-                    <div class="kpi-icon">✅</div>
-                    <div class="kpi-label">Acceptance Rate</div>
-                    <div class="kpi-value">{accepted_pct:.0f}%</div>
-                    <div class="kpi-delta">Of all submitted quotes</div>
+                  <div class="kpi5-card neutral">
+                    <div class="kpi5-flag">✅</div>
+                    <div class="kpi5-label">Acceptance Rate</div>
+                    <div class="kpi5-value">{accepted_pct:.0f}%</div>
+                    <div class="kpi5-sub">of all submitted quotes</div>
                   </div>
                 </div>
                 """, unsafe_allow_html=True)
 
                 c1, c2 = st.columns(2)
                 with c1:
-                    cat_cnt = df["category"].value_counts().reset_index()
-                    cat_cnt.columns = ["Category", "Count"]
-                    fig = px.pie(
-                        cat_cnt,
-                        names="Category",
-                        values="Count",
-                        title="Quotes by Category",
-                        hole=0.42,
-                        color_discrete_sequence=px.colors.sequential.Blues_r,
+                    sup_spend = (
+                        df.groupby("supplier")["total_price"].sum()
+                        .reset_index()
+                        .rename(columns={"total_price": "Total Spend", "supplier": "Supplier"})
+                        .sort_values("Total Spend", ascending=False)
                     )
+                    fig = px.bar(
+                        sup_spend, x="Supplier", y="Total Spend",
+                        title="Total Spend by Contractor",
+                        color="Total Spend",
+                        color_continuous_scale=["#B3D9F0", "#0072BC", "#003B6F"],
+                        text="Total Spend",
+                    )
+                    fig.update_traces(texttemplate="£%{text:,.0f}", textposition="outside",
+                                      textfont=dict(size=9))
                     fig.update_layout(
-                        plot_bgcolor="rgba(0,0,0,0)",
-                        paper_bgcolor="rgba(0,0,0,0)",
-                        margin=dict(t=40, b=10),
-                        legend=dict(font=dict(size=10)),
+                        plot_bgcolor="#F8FAFE", paper_bgcolor="rgba(0,0,0,0)",
+                        xaxis=dict(tickangle=-20, tickfont=dict(size=9), title=""),
+                        yaxis=dict(tickprefix="£", tickfont=dict(size=10),
+                                   gridcolor="#E2ECF8", title=""),
+                        margin=dict(t=40, b=10, l=10, r=10),
+                        coloraxis_showscale=False,
                         title_font=dict(size=13, color="#1A237E"),
                     )
-                    fig.update_traces(textposition="inside", textinfo="percent+label",
-                                      textfont_size=10)
                     st.plotly_chart(fig, use_container_width=True)
 
                 with c2:
@@ -1090,7 +1485,7 @@ Be direct, use numbers, and reference contractor names and water industry standa
                 # ── Quote table ────────────────────────────────────────────────
                 with st.expander("📋  Full quote register", expanded=False):
                     st.dataframe(
-                        df[["id", "date", "supplier", "category", "description",
+                        df[["id", "date", "supplier", "description",
                             "total_price", "currency", "status"]]
                         .assign(date=df["date"].dt.strftime("%Y-%m-%d"))
                         .sort_values("date", ascending=False)
@@ -1099,6 +1494,7 @@ Be direct, use numbers, and reference contractor names and water industry standa
                     )
             except Exception as e:
                 st.error(f"Could not load database: {e}")
+
 
 
 if __name__ == "__main__":
