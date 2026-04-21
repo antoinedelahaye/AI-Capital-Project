@@ -960,7 +960,7 @@ with tab2:
         quote_text = ""
         uploaded = st.file_uploader(
             "Upload a quote document",
-            type=["txt", "json", "csv", "pdf"],
+            type=["pdf"],
             label_visibility="collapsed",
         )
         if uploaded:
